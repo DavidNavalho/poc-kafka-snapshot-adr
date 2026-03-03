@@ -180,6 +180,7 @@ sed -n '1,200p' artifacts/latest/phase9_compact_report.md
 ## 5. Legacy experiments (Phase 1-7)
 
 Use:
-- `HARNESS-LEGACY-PHASES.md`
+- `docs/legacy/HARNESS-LEGACY-PHASES.md`
 
 That document contains historical run commands and walkthrough pointers for older phases.
+Individual phase walkthroughs are also in `docs/legacy/`.
