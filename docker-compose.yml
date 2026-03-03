@@ -1,0 +1,140 @@
+name: kafka-dr-lab
+
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-server:8.1.0
+  restart: unless-stopped
+  environment: &kafka-common-env
+    KAFKA_PROCESS_ROLES: "broker,controller"
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+    KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+    KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+    KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+    KAFKA_MIN_INSYNC_REPLICAS: "2"
+    KAFKA_NUM_PARTITIONS: "6"
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+    KAFKA_METADATA_LOG_DIR: "/var/lib/kafka/data"
+    KAFKA_JMX_PORT: "9999"
+    KAFKA_JMX_HOSTNAME: "localhost"
+    KAFKA_JMX_OPTS: "-Dcom.sun.management.jmxremote=true -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=localhost"
+    KAFKA_AUTHORIZER_CLASS_NAME: "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
+    KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+    KAFKA_SUPER_USERS: "User:ANONYMOUS"
+    KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: "3"
+    KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: "3"
+    CONFLUENT_METRICS_ENABLE: "false"
+
+services:
+  source-broker-1:
+    <<: *kafka-common
+    hostname: source-broker-1
+    container_name: source-broker-1
+    environment:
+      <<: *kafka-common-env
+      CLUSTER_ID: "${SOURCE_CLUSTER_ID:-UNSET_SOURCE_CLUSTER_ID}"
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://source-broker-1:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@source-broker-1:9093,2@source-broker-2:9093,3@source-broker-3:9093"
+    volumes:
+      - ./data/source/broker1:/var/lib/kafka/data
+
+  source-broker-2:
+    <<: *kafka-common
+    hostname: source-broker-2
+    container_name: source-broker-2
+    environment:
+      <<: *kafka-common-env
+      CLUSTER_ID: "${SOURCE_CLUSTER_ID:-UNSET_SOURCE_CLUSTER_ID}"
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://source-broker-2:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@source-broker-1:9093,2@source-broker-2:9093,3@source-broker-3:9093"
+    volumes:
+      - ./data/source/broker2:/var/lib/kafka/data
+
+  source-broker-3:
+    <<: *kafka-common
+    hostname: source-broker-3
+    container_name: source-broker-3
+    environment:
+      <<: *kafka-common-env
+      CLUSTER_ID: "${SOURCE_CLUSTER_ID:-UNSET_SOURCE_CLUSTER_ID}"
+      KAFKA_NODE_ID: "3"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://source-broker-3:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@source-broker-1:9093,2@source-broker-2:9093,3@source-broker-3:9093"
+    volumes:
+      - ./data/source/broker3:/var/lib/kafka/data
+
+  source-schema-registry:
+    image: confluentinc/cp-schema-registry:8.1.0
+    hostname: source-schema-registry
+    container_name: source-schema-registry
+    restart: unless-stopped
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: "source-schema-registry"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "PLAINTEXT://source-broker-1:9092,PLAINTEXT://source-broker-2:9092,PLAINTEXT://source-broker-3:9092"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "3"
+    volumes:
+      - ./schemas:/opt/schemas:ro
+
+  target-broker-1:
+    <<: *kafka-common
+    hostname: target-broker-1
+    container_name: target-broker-1
+    environment:
+      <<: *kafka-common-env
+      CLUSTER_ID: "${TARGET_CLUSTER_ID:-UNSET_TARGET_CLUSTER_ID}"
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://target-broker-1:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@target-broker-1:9093,2@target-broker-2:9093,3@target-broker-3:9093"
+    volumes:
+      - ./data/target/broker1:/var/lib/kafka/data
+
+  target-broker-2:
+    <<: *kafka-common
+    hostname: target-broker-2
+    container_name: target-broker-2
+    environment:
+      <<: *kafka-common-env
+      CLUSTER_ID: "${TARGET_CLUSTER_ID:-UNSET_TARGET_CLUSTER_ID}"
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://target-broker-2:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@target-broker-1:9093,2@target-broker-2:9093,3@target-broker-3:9093"
+    volumes:
+      - ./data/target/broker2:/var/lib/kafka/data
+
+  target-broker-3:
+    <<: *kafka-common
+    hostname: target-broker-3
+    container_name: target-broker-3
+    environment:
+      <<: *kafka-common-env
+      CLUSTER_ID: "${TARGET_CLUSTER_ID:-UNSET_TARGET_CLUSTER_ID}"
+      KAFKA_NODE_ID: "3"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://target-broker-3:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@target-broker-1:9093,2@target-broker-2:9093,3@target-broker-3:9093"
+    volumes:
+      - ./data/target/broker3:/var/lib/kafka/data
+
+  target-schema-registry:
+    image: confluentinc/cp-schema-registry:8.1.0
+    hostname: target-schema-registry
+    container_name: target-schema-registry
+    restart: unless-stopped
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: "target-schema-registry"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "PLAINTEXT://target-broker-1:9092,PLAINTEXT://target-broker-2:9092,PLAINTEXT://target-broker-3:9092"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "3"
+    volumes:
+      - ./schemas:/opt/schemas:ro

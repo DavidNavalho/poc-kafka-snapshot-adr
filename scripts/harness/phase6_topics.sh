@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# topic|partitions|seed_messages|cleanup_policy
+PHASE6_TOPIC_SPECS=(
+  "dr.p6.secure.orders|4|700|delete"
+  "dr.p6.secure.audit|3|500|delete"
+  "dr.p6.secure.state|4|650|compact"
+)
+
+PHASE6_FULL_TOPIC="dr.p6.secure.orders"
+PHASE6_PARTIAL_TOPIC="dr.p6.secure.state"
+
+PHASE6_FULL_GROUP="${PHASE6_FULL_GROUP:-dr.phase6.group.full}"
+PHASE6_PARTIAL_GROUP="${PHASE6_PARTIAL_GROUP:-dr.phase6.group.partial}"
+
+PHASE6_PARTIAL_INITIAL_MESSAGES="${PHASE6_PARTIAL_INITIAL_MESSAGES:-220}"
+PHASE6_PARTIAL_RESUME_MESSAGES="${PHASE6_PARTIAL_RESUME_MESSAGES:-120}"
+
+PHASE6_ACL_PRODUCER_PRINCIPAL="${PHASE6_ACL_PRODUCER_PRINCIPAL:-User:app-producer}"
+PHASE6_ACL_FULL_CONSUMER_PRINCIPAL="${PHASE6_ACL_FULL_CONSUMER_PRINCIPAL:-User:app-consumer-full}"
+PHASE6_ACL_PARTIAL_CONSUMER_PRINCIPAL="${PHASE6_ACL_PARTIAL_CONSUMER_PRINCIPAL:-User:app-consumer-partial}"
+PHASE6_ACL_ADMIN_PRINCIPAL="${PHASE6_ACL_ADMIN_PRINCIPAL:-User:ops-admin}"
+PHASE6_ACL_DENY_PRINCIPAL="${PHASE6_ACL_DENY_PRINCIPAL:-User:bad-actor}"

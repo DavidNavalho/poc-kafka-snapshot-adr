@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+message CustomerKey {
+  string customer_id = 1;
+}

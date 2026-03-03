@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+*.swp
+.idea/
+
+# Test data (generated at runtime)
+artifacts/
+data/
+
+# IDE
+.vscode/
+*.iml
+
+# Local environment
+.env
+.env.local

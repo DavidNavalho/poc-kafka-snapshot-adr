@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+message OrderEvent {
+  string order_id = 1;
+  int32 amount = 2;
+  string status = 3;
+  int64 event_ts = 4;
+}
