@@ -24,6 +24,16 @@ Topic intent:
 - `TOPIC_SMOKE_WRITE`: low-risk canary topic used for post-restore write/read probe.
 - Do not use internal topics (`__consumer_offsets`, `__transaction_state`) for smoke writes.
 
+Assumptions:
+- Broker logs are always available and queryable without traversing the full log volume.
+  Examples: centralised log aggregation (Elasticsearch, Splunk, CloudWatch Logs), or direct
+  access to the broker log file with the ability to tail/search a bounded recent window.
+  Steps that reference log searches are written assuming such access; if logs are only
+  available as raw files on large disks, treat those steps as `🚫 Defer` until the system
+  is running and log forwarding is active.
+- Filesystem commands operate on mounted, readable data directories.
+- All Kafka CLI tools are available on the operator's path.
+
 ---
 
 ## 2. Phased rollout for large client fleets
@@ -214,11 +224,42 @@ For each condition:
 - Recovery actions.
 - What to automate later.
 
+---
+
+### Low-likelihood: identity mismatch conditions (§4.1, §4.2, §4.13)
+
+Sections §4.1, §4.2, and §4.13 cover conditions that should **not** arise in a well-executed
+full snapshot restore of the same cluster — if the snapshot is consistent and all broker
+directories are correctly assigned, identity values will match by construction.
+
+They are documented here because:
+- They have high diagnostic impact if they *do* appear (broker refuses to start, or partitions
+  silently go offline).
+- They can arise in hybrid or migration scenarios where snapshot sources are mixed.
+- They share a common secondary effect: the failing broker's crash loop destabilises otherwise
+  healthy brokers via ISR churn.
+
+Unless you have reason to suspect a mixed-source snapshot, do a quick pass on these checks
+as part of the pre-boot gate (Phase 1), then move on. Do not spend time on deep
+investigation of these conditions unless brokers refuse to start or partitions go stray.
+
+---
+
 ### 4.1 Cluster identity mismatch (`cluster.id`)
+
+> **Likelihood in a full snapshot restore: LOW.** A complete snapshot of all broker data
+> directories from the same cluster will carry a consistent `cluster.id` everywhere. This
+> condition is most likely to appear when snapshots are assembled from multiple sources, or
+> when a broker directory is accidentally taken from a different cluster. Document here for
+> completeness and for hybrid/migration scenarios.
 
 Observe:
 - Broker refuses startup.
 - Logs contain mismatch text.
+- **Secondary effect**: the mismatched broker enters a crash loop, which causes ISR churn on
+  the working brokers (the crash loop disrupts the ISR of topics the broken broker was a
+  replica for, and can trigger transient restarts on otherwise-healthy brokers). If a
+  seemingly-healthy broker is unstable, check whether a *different* broker is the root cause.
 
 Common log shape:
 ```text
@@ -227,9 +268,9 @@ Invalid cluster.id in .../meta.properties. Expected <X>, but read <Y>
 
 Verify:
 ```bash
-grep -Ehi 'Invalid cluster.id|Expected .* but read|inconsistent clusterId' <broker-log-files>
 for b in $BROKERS; do grep '^cluster.id=' "${TARGET_DATA_ROOT}/broker${b}/meta.properties"; done
 ```
+Search logs for: `Invalid cluster.id`, `Expected .* but read`, `inconsistent clusterId`
 
 Recover:
 
@@ -257,14 +298,26 @@ mv /tmp/meta.${BAD_BROKER} "${TARGET_DATA_ROOT}/broker${BAD_BROKER}/meta.propert
 # Restart only the corrected broker, then rerun quorum and partition checks.
 ```
 
+4. Once the broken broker is corrected and restarted, working brokers that were experiencing
+   ISR churn should stabilise on their own within a few election cycles.
+
 Automate later:
 - Pre-start uniformity gate on `cluster.id` across all target brokers.
 - Majority-vote logic to identify the outlier rather than requiring manual identification.
 
 ### 4.2 Node identity mismatch (`node.id`)
 
+> **Likelihood in a full snapshot restore: LOW.** As with `cluster.id`, a full snapshot of
+> correctly provisioned brokers will carry the right `node.id` in each data directory. This
+> condition is most likely to appear when broker directories are reassigned or remounted to
+> different hosts during the restore process.
+
 Observe:
 - Broker startup errors; quorum instability.
+- **Secondary effect**: same ISR churn pattern as §4.1 — a broker stuck in a crash loop due
+  to a `node.id` mismatch disrupts the ISR of its assigned partitions, causing instability on
+  otherwise-healthy brokers. Diagnose all brokers' `meta.properties` before assuming the
+  unstable broker is itself misconfigured.
 
 Verify:
 ```bash
@@ -275,12 +328,13 @@ done
 ```
 
 Recover:
-- Correct `node.id` in each `meta.properties` to match broker identity.
+- Correct `node.id` in each affected `meta.properties` to match the broker's expected identity.
 - Restart corrected brokers.
-- Re-run quorum + partition checks.
+- Re-run quorum + partition checks; ISR churn on working brokers should clear once the
+  mismatched broker restarts cleanly.
 
 Automate later:
-- Static mapping check: directory/broker name -> expected `node.id`.
+- Static mapping check: directory/broker name → expected `node.id`.
 
 ### 4.3 Stale quorum-state / election instability
 
@@ -519,16 +573,23 @@ Automate later:
 Observe:
 - Producer receives epoch/sequence exceptions.
 
-Common error classes:
+Common error classes (any of the following indicate this condition):
 ```text
-InvalidProducerEpochException
 OutOfOrderSequenceException
 ProducerFencedException
+InvalidProducerEpochException
+InvalidTxnStateException
+TransactionAbortableException
 ```
+
+The last two (`InvalidTxnStateException`, `TransactionAbortableException`) are raised by
+some broker implementations (e.g. Confluent Platform) when the client-side transaction state
+machine detects an inconsistency before the broker even responds — they are functionally
+equivalent to the classic epoch/sequence exceptions for recovery purposes.
 
 Verify:
 ```bash
-grep -E 'InvalidProducerEpochException|OutOfOrderSequenceException|ProducerFencedException' \
+grep -E 'OutOfOrderSequenceException|ProducerFencedException|InvalidProducerEpochException|InvalidTxnStateException|TransactionAbortableException' \
   <producer-logs> <broker-logs>
 ```
 
@@ -635,7 +696,18 @@ Recover:
 Automate later:
 - Post-crash acceptance gate using quorum + offset + duplicate-window checks.
 
-### 4.13 Partition metadata topic UUID mismatch
+---
+
+### Low-likelihood (continued): §4.13
+
+### 4.13 Partition metadata UUID mismatch (`partition.metadata`)
+
+> **Likelihood in a full snapshot restore: LOW.** A complete snapshot of a cluster taken at
+> a consistent point in time will carry matching UUIDs everywhere — the KRaft metadata log
+> and the `partition.metadata` files in each partition directory are from the same cluster
+> identity. This condition arises specifically when snapshots are assembled from mismatched
+> sources (e.g. data directories from cluster A, KRaft metadata log from cluster B or from a
+> different point in time), or in explicit cluster identity migration scenarios.
 
 Observe:
 - Partitions silently go OFFLINE shortly after broker start.
@@ -651,46 +723,58 @@ WARN  Partition topic-name-0 is not found in metadata log; skipping directory
 
 This condition arises when the `partition.metadata` file inside each partition directory
 contains a topic UUID that does not match the UUID registered in the KRaft metadata log.
-This can happen when the partition data files and the KRaft metadata were sourced from
-different clusters (or different time points with different UUIDs).
 
 Verify:
+
+**Step 1 — check for stray directories (⚡ instant, targeted):**
+Do this first. It confirms the problem is present without touching the full data tree.
 ```bash
-# Inspect partition.metadata files on each broker
-find "${TARGET_DATA_ROOT}/broker<id>" -name "partition.metadata" | while read f; do
-  echo "=== $f ==="; cat "$f"
+# Scope to known critical topic directories only
+find "${TARGET_DATA_ROOT}/broker<id>/<critical-topic-name>-*" -maxdepth 0 -name "*-stray" -type d
+```
+
+**Step 2 — inspect `partition.metadata` for critical partitions only (⚡ instant, targeted):**
+```bash
+# Only check the specific critical topic partitions, not the whole data root
+for part_dir in "${TARGET_DATA_ROOT}/broker<id>/<critical-topic-name>"-*; do
+  echo "=== ${part_dir} ==="; cat "${part_dir}/partition.metadata" 2>/dev/null || echo "missing"
 done
+```
 
-# Check for stray directory renames
-find "${TARGET_DATA_ROOT}/broker<id>" -maxdepth 3 -name "*-stray" -type d
-
-# Cross-reference with KRaft-registered topic UUIDs (requires metadata snapshot access)
+**Step 3 — cross-reference KRaft metadata log (🕐 fast, but requires metadata snapshot access):**
+```bash
 kafka-dump-log --files <path-to-latest-metadata-snapshot> --cluster-metadata-decoder \
   | grep -i 'TopicRecord\|PartitionRecord' | head -100
 ```
 
+> **🚫 Avoid** running a recursive `find` over the full data root to enumerate all
+> `partition.metadata` files on a large snapshot (hundreds of GB to TB). Scope to the
+> critical topic set first. Expand the scan to other topics only after the system is running
+> and the check can be run as a background deferred task.
+
 Recover:
 
-**Option 1 — Fresh KRaft with new cluster.id (common in test/migration scenarios)**:
+**Option 1 — Preserved cluster.id (same-cluster restore — expected path)**:
+If the KRaft metadata and partition data came from the same cluster at a consistent snapshot
+time, UUIDs must match. A mismatch here indicates the snapshot was assembled from
+inconsistent sources. Stop, investigate which source each directory set came from, and
+correct before starting brokers.
+
+**Option 2 — Fresh KRaft with new cluster.id (migration / test scenarios)**:
 The topic UUIDs in `partition.metadata` were generated by the source cluster and will never
-match a newly formatted KRaft cluster. Delete the stray directories (they contain the
-original data), then let Kafka create new partition directories when topics are created and
-replicas assigned:
+match a newly formatted KRaft cluster. Stray directories are expected in this case.
+Delete them, then re-create topics and assign replicas:
 ```bash
 # After verifying stray directories are the ones you intended to restore
 rm -rf "${TARGET_DATA_ROOT}/broker<id>/<topic>-<partition>-stray"
-# Re-create topics, then use partition reassignment API to assign replicas to this broker
+# Re-create topics via admin API, then use partition reassignment to assign replicas
 ```
 
-**Option 2 — Preserved cluster.id (same-cluster restore)**:
-If the KRaft metadata and partition data came from the same cluster identity, UUIDs should
-match. A mismatch here indicates the snapshot was assembled from inconsistent sources.
-Investigate which source each file set came from before proceeding.
-
 Automate later:
-- Pre-start check: for each critical partition directory, validate that `partition.metadata`
-  UUID matches the UUID in the KRaft metadata log. Alert on mismatch before broker start
-  to avoid silent partition loss.
+- Pre-start targeted check: for each **critical** partition directory only, validate that
+  `partition.metadata` UUID matches the UUID in the KRaft metadata log. Alert on mismatch
+  before broker start to avoid silent partition loss. Expand to non-critical partitions
+  as a deferred background task after the system is running.
 
 ---
 
@@ -749,3 +833,167 @@ No specific tooling assumed. Treat each bundle as a callable unit.
 - consumer-group duplicate window within policy (if applicable)
 - no unresolved critical exceptions in broker/producer logs
 - no stray partition directories in critical topic set
+
+---
+
+## 6. TL;DR — Automation checklist for snapshot restore
+
+Flat ordered checklist. Run steps in order. Each step includes a time-cost label:
+
+- ⚡ **Instant** — file reads or single metadata queries, completes in seconds.
+- 🕐 **Fast** — a handful of CLI calls or a short wait, completes in under a minute.
+- 🕑 **Slow** — involves a broker restart or a convergence wait, takes several minutes.
+- 🚫 **Defer** — log scans, full topic/group enumerations, or full filesystem traversals.
+  Run only after the cluster is serving traffic, in a bounded background window.
+
+If a step has a `→ see §X.Y` reference, that section contains the full recovery procedure.
+
+---
+
+### Stage 1 — Pre-boot (run before starting any broker)
+
+**1. Verify `meta.properties` exists on every broker.** ⚡
+- Check: file present at `<data-root>/broker<id>/meta.properties` on each node.
+- Pass: all brokers have the file.
+- Fail: missing file means the data directory is incomplete or the wrong path is mounted.
+  Do not start brokers. Investigate snapshot completeness.
+
+**2. Check `cluster.id` is uniform across all brokers.** ⚡
+- Read `cluster.id` from each broker's `meta.properties`.
+- Pass: all values are identical.
+- Fail: identify the outlier (majority value is authoritative). Correct only the mismatched
+  broker. → see §4.1
+
+**3. Check `node.id` matches the expected broker identity on each node.** ⚡
+- Read `node.id` from each broker's `meta.properties`.
+- Pass: each broker's `node.id` matches the static mapping for that host/directory.
+- Fail: correct the `node.id` in `meta.properties` for the affected broker. → see §4.2
+
+**4. Note clean-shutdown status per broker.** ⚡
+- Check: presence of `.kafka_cleanshutdown` marker in each data directory.
+- Pass (marker present): no segment replay on startup; fast boot expected.
+- Pass (marker absent): full log segment recovery will run; startup is slower and a small
+  duplicate window is expected. Note which brokers are in this state for §4.10 planning.
+
+**5. Check critical partition directories exist on their assigned brokers.** ⚡
+- Verify that the data directories for your critical topics exist on the expected brokers.
+- Pass: directories present.
+- Fail: missing partition directories indicate an incomplete snapshot. Do not start brokers.
+
+**6. Check for stray directories on critical topic partitions.** ⚡
+- Check: look for `<topic>-<partition>-stray` directories under the critical topic paths only
+  (do not scan the full data root).
+- Pass: no stray directories found.
+- Fail: UUID mismatch between partition data and KRaft metadata. Investigate snapshot source
+  consistency before starting brokers. → see §4.13
+
+---
+
+### Stage 2 — Startup (start brokers, then verify control plane)
+
+**7. Start all brokers simultaneously.** 🕑
+- Start all voter nodes within a few seconds of each other to avoid a stale single-node
+  quorum forming. → see §4.3 for quorum startup ordering guidance.
+
+**8. Verify quorum has a stable leader.** ⚡
+- Command: `kafka-metadata-quorum --bootstrap-server <bootstrap> describe --status`
+- Pass: a valid leader exists; high-watermark is advancing; no rapid leader changes.
+- Fail: repeated re-elections or no leader. Stop all brokers and start simultaneously.
+  → see §4.3
+
+**9. Verify all intended brokers are visible in metadata.** ⚡
+- Command: `kafka-metadata-quorum ... describe --replication` (or equivalent admin describe).
+- Pass: all expected broker IDs are listed as active voters/observers.
+- Fail: missing broker — check if that broker is up and reachable; inspect its startup logs.
+
+**10. Verify no offline partitions in the critical topic set.** ⚡
+- Command: `kafka-topics --bootstrap-server <bootstrap> --describe --unavailable-partitions`
+- Pass: output is empty (no `Leader: -1` partitions).
+- Fail: trigger preferred leader election for affected partitions. If brokers for those
+  replicas are down, bring them up and recheck. → see §4.5
+
+---
+
+### Stage 3 — Data plane (verify I/O before admitting clients)
+
+**11. Read end offsets for the critical restored topic.** ⚡
+- Command: `kafka-get-offsets --bootstrap-server <bootstrap> --topic <TOPIC_RESTORE_CHECK> --time -1`
+- Pass: offsets are readable and at or above the expected snapshot baseline.
+- Fail (offsets missing or zero): ISR may not have converged yet — wait and retry.
+  If still failing after ISR is stable, investigate data regression. → see §4.11
+- Fail (OFFSET_OUT_OF_RANGE): one broker has a slightly older snapshot; will self-heal as
+  the follower truncates to match the leader. → see §4.6
+
+**12. Run smoke produce/consume on the canary topic.** 🕐
+- Write a small batch (e.g. 10–20 records) to `<TOPIC_SMOKE_WRITE>` and read them back.
+- Pass: writes accepted; reads return the expected records.
+- Fail: diagnose by checking quorum stability (Step 8) and ISR state (Step 10) first.
+
+**13. Wait for ISR convergence on critical topics.** 🕑
+- Command: `kafka-topics --bootstrap-server <bootstrap> --describe --topic <TOPIC_RESTORE_CHECK>`
+- Pass: ISR set equals the full replica set on all critical partitions.
+- If slow to converge: this is normal after an unclean snapshot. Allow time proportional to
+  the amount of unflushed data. Do not restart brokers to "speed up" convergence — it resets
+  the fetch cycle. → see §4.6
+
+**14. Check transaction state (only if transactional workloads are in scope).** 🕐
+- Command: `kafka-transactions --bootstrap-server <bootstrap> list`
+- Pass: no transactions stuck in `ONGOING` longer than `transaction.timeout.ms`.
+  `PREPARE_COMMIT` or `PREPARE_ABORT` states should self-resolve within seconds of
+  coordinator startup.
+- Fail (ONGOING stuck): restart the coordinator leader broker to force coordinator reload.
+  → see §4.8
+
+**15. Check for producer epoch/state exceptions in producer logs.** 🕐
+- Search producer and broker logs for:
+  `OutOfOrderSequenceException`, `ProducerFencedException`, `InvalidProducerEpochException`,
+  `InvalidTxnStateException`, `TransactionAbortableException`
+- Pass: no occurrences, or exceptions that self-resolved after producer reinit.
+- Fail (persistent): reinit the producer with the same `transactional.id` using a new
+  `KafkaProducer` instance and call `initTransactions()`. → see §4.9
+
+**16. Check consumer group offset positions for critical groups.** 🕐
+- Command: `kafka-consumer-groups --bootstrap-server <bootstrap> --describe --group <group_id>`
+- Check: compare committed offset vs. expected post-snapshot baseline.
+- Pass: group lag is within the accepted duplicate window (bounded by
+  `replica.high.watermark.checkpoint.interval.ms`, default 5 seconds per partition).
+- Fail (offset far behind): determine if application-level deduplication covers the gap.
+  If not, manually advance offsets to a safe point. → see §4.10
+
+---
+
+### Stage 4 — Client ramp
+
+**17. Ramp clients in cohorts.** 🕑
+- Suggested progression: 1% → 10% → 25% → 50% → 100%.
+- At each cohort, hold long enough to observe: consumer lag stability, producer error rate,
+  group progress, and broker CPU/network (not a Kafka-level check — use your monitoring).
+- Advance only if all Stage 2 and Stage 3 checks remain green.
+
+---
+
+### Stage 5 — Deferred background checks (system already running)
+
+Run these checks after traffic is flowing and the system is stable. They are too expensive
+to run before cutover on large snapshots.
+
+**18. All-topic offline partition scan.** 🚫
+- Scope progressively: start with the next tier of important topics, then all topics.
+- Run in off-peak windows; avoid large `--describe` dumps during peak load.
+
+**19. All consumer group offset audit.** 🚫
+- Run in batches, not all groups at once.
+- Compare committed offsets against post-restore expected baselines for all groups.
+
+**20. Broker log scan for truncation/corruption signatures.** 🚫
+- Search for: `Found invalid messages`, `discarding tail`, `Recovering unflushed segments`,
+  `CorruptRecordException` — bounded to a time window around the snapshot timestamp.
+- Any findings after the system is running and stable are informational; they do not
+  require remediation unless LEO has regressed on a partition. → see §4.7
+
+**21. Full `partition.metadata` UUID audit across all topics.** 🚫
+- Expand the targeted check from Step 6 to all partition directories.
+- Run as a background scan; do not block traffic on this.
+- Any stray directories found at this stage are either already visible as offline partitions
+  (caught in Step 10/18) or are for non-critical data. Investigate and remediate by policy.
+  → see §4.13
