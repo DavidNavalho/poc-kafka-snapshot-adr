@@ -159,10 +159,10 @@ for b in $BROKERS; do
     || echo "MISSING meta.properties on broker${b}"
   grep '^cluster.id=' "${TARGET_DATA_ROOT}/broker${b}/meta.properties"
   grep '^node.id='    "${TARGET_DATA_ROOT}/broker${b}/meta.properties"
-  # Clean shutdown marker: absence means unclean shutdown — expect full log recovery
+  # Clean shutdown marker check — for a live-cluster snapshot this will almost always be absent.
   test -f "${TARGET_DATA_ROOT}/broker${b}/.kafka_cleanshutdown" \
-    && echo "broker${b}: clean shutdown marker present (no recovery replay expected)" \
-    || echo "broker${b}: NO clean shutdown marker — full log segment recovery will run on start"
+    && echo "broker${b}: clean shutdown marker present (uncommon for live snapshots)" \
+    || echo "broker${b}: no clean shutdown marker — full log segment recovery expected on start"
 done
 ```
 
@@ -170,9 +170,11 @@ Expected:
 - `meta.properties` exists on every broker.
 - `cluster.id` identical across brokers.
 - `node.id` matches broker identity.
-- Note the clean-shutdown status per broker: brokers without `.kafka_cleanshutdown` will
-  replay all unflushed log segments above `recovery-point-offset-checkpoint` on startup.
-  This is normal but increases startup time and creates a small duplicate-processing window.
+- `.kafka_cleanshutdown` will be **absent on almost all brokers** in a live-cluster snapshot.
+  This is the normal, expected state. Every broker without the marker will replay all
+  unflushed log segments above `recovery-point-offset-checkpoint` on startup, which increases
+  startup time and creates a bounded duplicate-processing window (see §4.10). Plan for this
+  rather than treating it as an anomaly.
 
 ### 3.2 Quorum and partition health
 
@@ -587,47 +589,91 @@ some broker implementations (e.g. Confluent Platform) when the client-side trans
 machine detects an inconsistency before the broker even responds — they are functionally
 equivalent to the classic epoch/sequence exceptions for recovery purposes.
 
-Verify:
+Operator-side detection (without client log access):
+
+Errors from producer epoch/state corruption are raised on the client, which the operations
+team may not have access to. However, the broker logs every rejection it sends to a
+producer, so broker log search is sufficient for detection. Additionally, the full
+transaction state is visible and controllable from the broker side:
+
+```bash
+# Detect via broker logs (no client access required)
+grep -E 'OutOfOrderSequenceException|ProducerFencedException|InvalidProducerEpochException|InvalidTxnStateException|TransactionAbortableException' \
+  <broker-logs>
+
+# List all active transactional producers and their current state
+kafka-transactions --bootstrap-server "$TARGET_BOOTSTRAP" list
+
+# Inspect a specific transactional producer (shows producer ID, epoch, last timestamp)
+kafka-transactions --bootstrap-server "$TARGET_BOOTSTRAP" \
+  describe --transactional-id <TXN_ID_CRITICAL>
+
+# Force-abort a stuck transaction from the broker side (Kafka 3.x / KIP-664)
+# Use producer-id and producer-epoch from the describe output above
+kafka-transactions --bootstrap-server "$TARGET_BOOTSTRAP" \
+  abort --transactional-id <id> --producer-id <pid> --producer-epoch <epoch>
+```
+
+> **Note on non-transactional idempotent producers** (no `transactional.id`): there is no
+> operator-side force-abort available. The broker still logs the rejection with the PID and
+> epoch at the time of refusal — use this to provide the client team a precise
+> "producer with PID X needs to reinitialise" signal without requiring them to triage their
+> own logs.
+
+Verify (client-side, if accessible):
 ```bash
 grep -E 'OutOfOrderSequenceException|ProducerFencedException|InvalidProducerEpochException|InvalidTxnStateException|TransactionAbortableException' \
-  <producer-logs> <broker-logs>
+  <producer-logs>
 ```
 
 Recover:
 1. Keep the **same `transactional.id`** — do not change it. The `transactional.id` is how
    the coordinator maps to the producer's epoch history. Changing it creates a new producer
    identity and leaves the old transaction state as a zombie in `__transaction_state`.
-2. Stop the existing producer instance (do not call `close()` on the hung producer if it is
-   in a fenced state; just discard it).
-3. Create a **new `KafkaProducer` instance** with the same `transactional.id` and call
-   `initTransactions()`. This causes the coordinator to bump the epoch, fencing any old
-   producer instance that may still be running.
+2. If a transaction is stuck in `ONGOING` state past `transaction.timeout.ms`, force-abort
+   it from the broker side using the `kafka-transactions abort` command above. This unblocks
+   the coordinator without requiring client action.
+3. Once the stuck transaction is cleared (or if no stuck transaction exists), the client
+   should stop the existing producer instance (do not call `close()` on a hung/fenced
+   producer; just discard it), create a **new producer instance** with the same
+   `transactional.id`, and call `initTransactions()`. This causes the coordinator to bump
+   the epoch, fencing any old instance.
 4. Resume producing with the new instance.
-5. **Exception**: If `__transaction_state` was copied from a source cluster at a point where
-   the epoch had already advanced further than the destination cluster's copy, calling
-   `initTransactions()` may still be rejected with a higher-epoch conflict. This is a
-   cluster-copy-specific scenario; see the `transaction-adr.md` document for epoch-reset
-   options.
+5. **Exception — epoch already ahead on the destination**: if `__transaction_state` was
+   captured from a source cluster where the epoch had already advanced further than the
+   destination's copy, `initTransactions()` may still be rejected with a higher-epoch
+   conflict. In this case, use `kafka-transactions abort` with the epoch value shown in
+   the broker's rejection log entry to clear the stale coordinator state, then retry
+   `initTransactions()` from the client.
 
 Automate later:
-- Exception-class trigger -> producer reinit with same `transactional.id` + verify loop.
+- Broker log monitor for epoch/state exception classes → alert ops team.
+- `kafka-transactions list` poll → flag any `ONGOING` transactions older than
+  `transaction.timeout.ms` for automatic force-abort.
+- Post-abort verify: confirm same `transactional.id` can successfully `initTransactions()`.
 
 ### 4.10 Consumer group offset re-processing window
+
+> **Operator control**: Unlike producer epoch exceptions (§4.9), consumer group offset state
+> is fully visible and controllable from the operator side without any client involvement.
+> The operator can read current committed offsets, estimate the reprocessing window, and
+> advance offsets to a safe point — all via CLI — before clients are admitted.
 
 Observe:
 - Consumers restart from older committed offsets.
 - Duplicate processing window appears after restore.
 
 > **Quantified bounds**: The re-processing window is bounded by
-> `replica.high.watermark.checkpoint.interval.ms` (default: **5000ms**). In the worst
-> case (all brokers crashed without clean shutdown, page cache flushed at crash time, last
-> HWM checkpoint was 5 seconds before the crash), consumers may re-process up to 5 seconds
-> of messages **per partition**.
+> `replica.high.watermark.checkpoint.interval.ms` (default: **5000ms**). Because a
+> live-cluster snapshot will not have a clean-shutdown marker, all brokers will replay
+> unflushed segments on startup. In the worst case (page cache not yet flushed to disk,
+> last HWM checkpoint written 5 seconds before the snapshot was taken), consumers may
+> re-process up to 5 seconds of messages **per partition**. Treat this as the baseline
+> expectation, not an edge case.
 >
-> With snapshot restores, the actual window depends on the delta between the snapshot
-> capture time and the most recent HWM checkpoint file timestamp. Check the checkpoint
-> file mtime vs. snapshot timestamp to estimate the actual per-partition reprocessing
-> window before ramp.
+> The actual window depends on the delta between the snapshot capture time and the most
+> recent HWM checkpoint file timestamp. Check the checkpoint file mtime vs. the snapshot
+> timestamp to estimate the actual per-partition reprocessing window before ramp.
 
 Verify:
 ```bash
@@ -674,15 +720,18 @@ Automate later:
 
 ### 4.12 Simultaneous crash restore behavior
 
+> This section applies to simultaneous crash (all nodes powered off instantaneously) and is
+> also the **normal startup path for any live-cluster snapshot restore** — both are
+> equivalent at the filesystem level since neither produces clean-shutdown markers. Expect
+> full log segment recovery on every broker; this is not an anomaly.
+
 Observe:
-- Full log recovery on all brokers (no clean-shutdown marker path).
-- Small duplicate/replay window may appear depending on offset/checkpoint timing.
+- Full log segment recovery on all brokers (no clean-shutdown marker on any node).
+- Small duplicate/replay window appears; magnitude bounded by `replica.high.watermark.checkpoint.interval.ms` (see §4.10).
 
 Verify:
 ```bash
-# Absence of .kafka_cleanshutdown indicates unclean shutdown (also checked in §3.1)
-ls "${TARGET_DATA_ROOT}/broker<id>/.kafka_cleanshutdown" 2>/dev/null \
-  || echo "broker<id>: unclean shutdown detected"
+# Confirm full recovery is running (expected — treat as informational, not a problem)
 grep -Ehi 'Recovering unflushed segments|no clean shutdown' <broker-log-files>
 kafka-consumer-groups --bootstrap-server "$TARGET_BOOTSTRAP" --describe --group <group_id>
 ```
@@ -788,7 +837,8 @@ No specific tooling assumed. Treat each bundle as a callable unit.
 # A2 cluster.id uniform across brokers (identify outlier, not overwrite all)
 # A3 node.id mapping valid per broker
 # A4 critical topic partition dirs exist
-# A5 .kafka_cleanshutdown presence logged per broker (affects recovery time estimate)
+# A5 .kafka_cleanshutdown checked per broker — expected ABSENT for live-cluster snapshots;
+#    full segment recovery will run on startup (normal path, plan for longer boot time)
 # A6 partition.metadata UUID matches KRaft-registered UUID for critical partitions
 ```
 
@@ -869,11 +919,15 @@ If a step has a `→ see §X.Y` reference, that section contains the full recove
 - Pass: each broker's `node.id` matches the static mapping for that host/directory.
 - Fail: correct the `node.id` in `meta.properties` for the affected broker. → see §4.2
 
-**4. Note clean-shutdown status per broker.** ⚡
-- Check: presence of `.kafka_cleanshutdown` marker in each data directory.
-- Pass (marker present): no segment replay on startup; fast boot expected.
-- Pass (marker absent): full log segment recovery will run; startup is slower and a small
-  duplicate window is expected. Note which brokers are in this state for §4.10 planning.
+**4. Confirm full log segment recovery is expected on all brokers.** ⚡
+- Check: look for `.kafka_cleanshutdown` in each broker data directory.
+- Expected: the marker is **absent on all brokers** — this is the normal path for a
+  live-cluster snapshot. Every broker will run full log segment recovery on startup:
+  slower boot time and a bounded duplicate-processing window (up to
+  `replica.high.watermark.checkpoint.interval.ms`, default 5 s per partition) are expected.
+  Plan accordingly — do not treat the absence of the marker as a fault.
+- If present (rare): that broker will skip segment replay and boot faster. Note it, but
+  take no action — it is a best-case outcome, not something to engineer for.
 
 **5. Check critical partition directories exist on their assigned brokers.** ⚡
 - Verify that the data directories for your critical topics exist on the expected brokers.
